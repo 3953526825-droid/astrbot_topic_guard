@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-AstrBot 插件：话题守卫（topic_guard）
-自动检测对话话题是否结束并主动停止对话，支持双机器人互聊与人机对聊。
+AstrBot 插件：话题守卫（topic_guard）v1.2
+自动检测对话话题是否结束并主动停止对话。
+v1.2 变更：配置改为分组结构；问句/请求/@/关键词为强恢复信号（无视冷却）。
+核心原则：宁可不结束，绝不乱结束。
 """
 import asyncio
 import difflib
@@ -17,50 +19,55 @@ from astrbot.api.star import Context, Star
 
 try:
     from astrbot.api import AstrBotConfig
-except ImportError:  # 极老版本兜底
+except ImportError:
     AstrBotConfig = dict
 
 try:
     from astrbot.api.event import MessageChain
-except ImportError:  # 旧版本兜底
+except ImportError:
     from astrbot.api.message_components import MessageChain
 
 DEFAULT_JUDGE_SYSTEM_PROMPT = (
     "你是一个「对话话题状态检测器」。你的任务：判断给定的一段对话是否已经自然聊完、可以收尾停止。\n"
     "判定为「已结束」的典型情形：\n"
     "1. 双方在互相告别或客套收尾，例如“好的再见”“下次聊”“谢谢，没别的问题了”。\n"
-    "2. 对方提出的问题已经被解决，并且没有再提出新问题或新需求。\n"
-    "3. 对话陷入敷衍、重复，或只剩客套（如连续“嗯嗯”“好的”“哈哈”）。\n"
+    "2. 对方提出的问题已经被解决，且没有再提出新问题或新需求。\n"
+    "3. 双方都只是在敷衍回应（如连续“嗯”“好的”“哈哈”），没有任何一方再提出新内容。\n"
     "4. 对方明确表示要离开、下线、去忙别的。\n"
     "判定为「未结束」的典型情形：\n"
     "1. 对方提出了新问题、新话题，或明显还想继续聊。\n"
     "2. 对方正在表达情绪、观点或展开叙述。\n"
     "3. 对话中仍有未完成的任务。\n"
-    "注意：宁可保守一点，没有把握时判为未结束。\n"
+    "特别提醒：只要「对方」还在持续提出新内容——哪怕消息很短，例如“好饿”“谁让你带话”“要不你再发一遍”——都必须判定为「未结束」。宁可保守一点，没有把握时判为未结束。\n"
     "你必须只输出一个 JSON 对象，不要输出任何其他文字，格式："
     '{"ended": true 或 false, "score": 0到1的小数, "reason": "一句话理由"}'
 )
 
 DEFAULT_SUMMARY_PROMPT = "你是一个对话总结助手。请用一到两句话（不超过60字）总结这段对话的主要内容，语气自然。"
 
-DEFAULT_END_KEYWORDS = ["再见", "拜拜", "下次聊", "下次再聊", "改天聊", "回头聊", "先这样", "就到这", "不聊了", "下了", "告辞", "晚安", "886", "goodbye", "bye", "拜"]
+DEFAULT_END_KEYWORDS = ["再见", "拜拜", "下次聊", "下次再聊", "改天聊", "回头聊", "先这样", "就到这", "不聊了", "告辞", "晚安", "886", "goodbye", "bye"]
 
 DEFAULT_RESUME_KEYWORDS = ["在吗", "在不在", "在么", "新话题", "问个问题", "帮我", "你好", "hello", "hi", "呼叫"]
+
+DEFAULT_PERFUNCTORY = ["嗯", "嗯嗯", "哦", "哦哦", "好", "好的", "好吧", "哈哈", "呵呵", "是", "是的", "对", "没错", "行", "可以", "ok", "okay", "收到", "了解", "知道了", "嗯呐", "额", "呃"]
 
 DEFAULT_CLOSING = "🌙 这个话题聊得差不多啦，我先去待机了～有新话题随时喊我！"
 
 DEFAULTS = {
     "enable": True,
     "llm_judge_enable": True,
+    "block_when_stopped": True,
     "judge_model": "",
     "judge_threshold": 0.7,
     "judge_consecutive": 2,
+    "judge_min_interval_secs": 15,
     "judge_trigger_max_len": 40,
     "judge_interval": 3,
     "judge_bot_reply": True,
     "judge_bot_reply_max_len": 60,
     "judge_system_prompt": DEFAULT_JUDGE_SYSTEM_PROMPT,
     "end_keywords": DEFAULT_END_KEYWORDS,
+    "perfunctory_words": DEFAULT_PERFUNCTORY,
     "silence_enable": True,
     "silence_minutes": 10,
     "silence_check_interval": 30,
@@ -72,14 +79,17 @@ DEFAULTS = {
     "closing_mode": "message",
     "closing_message": DEFAULT_CLOSING,
     "closing_cooldown": 300,
+    "farewell_reply": "",
     "summary_prompt": DEFAULT_SUMMARY_PROMPT,
     "resume_notice": "",
     "auto_resume": True,
+    "private_auto_resume_all": True,
     "resume_min_len": 8,
     "resume_question_trigger": True,
     "resume_keywords": DEFAULT_RESUME_KEYWORDS,
     "resume_at_me": True,
-    "resume_cooldown_secs": 20,
+    "resume_cooldown_secs": 5,
+    "stop_after_resume_guard_secs": 30,
     "stop_ttl_minutes": 60,
     "other_bot_ids": [],
     "track_all_senders": False,
@@ -98,7 +108,16 @@ class TopicGuard(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.cfg = config if isinstance(config, dict) else {}
-        self.sessions = {}          # 会话ID -> 会话状态
+        # v1.2：配置改为分组结构，这里拍平方便读取
+        self.cfg_flat = {}
+        for v in self.cfg.values():
+            if isinstance(v, dict):
+                for k2, v2 in v.items():
+                    self.cfg_flat.setdefault(k2, v2)
+        for k, v in self.cfg.items():
+            if not isinstance(v, dict):
+                self.cfg_flat.setdefault(k, v)
+        self.sessions = {}
         self._stats = {"total_stops": 0, "reasons": {}}
         self._dirty = False
         self._sweeper_task = None
@@ -107,7 +126,11 @@ class TopicGuard(Star):
 
     # ---------------- 小工具 ----------------
     def _c(self, key):
-        v = self.cfg.get(key) if isinstance(self.cfg, dict) else None
+        v = None
+        if hasattr(self, "cfg_flat"):
+            v = self.cfg_flat.get(key)
+        if v is None and isinstance(self.cfg, dict):
+            v = self.cfg.get(key)
         return v if v is not None else DEFAULTS.get(key)
 
     def _enabled(self):
@@ -123,7 +146,6 @@ class TopicGuard(Star):
         return f"p:{event.get_sender_id()}"
 
     def _is_self(self, event):
-        """忽略机器人自己的消息回显"""
         try:
             mo = event.message_obj
             if mo is None:
@@ -151,6 +173,33 @@ class TopicGuard(Star):
             pass
         return False
 
+    def _clean_text(self, raw):
+        t = (raw or "").strip()
+        t = re.sub(r"^\[[^\[\]]{1,80}\]\s*", "", t)
+        t = re.sub(r"^【[^【】]{1,80}】\s*", "", t)
+        return t.strip()
+
+    def _is_question(self, text):
+        if "?" in text or "？" in text:
+            return True
+        for w in ("吗", "呢", "么", "怎么", "什么", "为什么", "干嘛", "干啥", "谁", "哪", "多少", "能不能", "可不可以", "要不要", "是不是", "咋", "嘛", "请", "帮"):
+            if w in text:
+                return True
+        return False
+
+    def _is_perfunctory(self, text):
+        t = text.strip().lower()
+        return t in [str(x).strip().lower() for x in self._c("perfunctory_words") if str(x).strip()]
+
+    def _hit_end_keywords(self, text):
+        if not text:
+            return False
+        low = text.lower()
+        for kw in self._c("end_keywords"):
+            if kw and kw.lower() in low:
+                return True
+        return False
+
     def _session_skip(self, event):
         cid = self._conv_id(event)
         bl = [str(x).strip() for x in self._c("group_blacklist") if str(x).strip()]
@@ -165,7 +214,6 @@ class TopicGuard(Star):
         return False
 
     def _is_counterpart(self, sender_id):
-        """判断发送者是否属于对话对方（双机器人场景按配置过滤）"""
         ids = [str(x).strip() for x in self._c("other_bot_ids") if str(x).strip()]
         if not ids:
             return True
@@ -177,19 +225,24 @@ class TopicGuard(Star):
         return {
             "cid": cid,
             "umo": umo,
-            "status": "active",          # active | stopped
+            "status": "active",
             "history": deque(maxlen=max(int(self._c("history_max")), 2)),
-            "turns": 0,                  # 本轮话题对方消息数
+            "turns": 0,
             "total_turns": 0,
             "last_peer_ts": 0.0,
             "last_bot_ts": 0.0,
-            "end_ema": 0.0,              # 话题结束倾向 EMA
+            "last_peer_text": "",
+            "last_bot_text": "",
+            "last_judge_ts": 0.0,
+            "end_ema": 0.0,
             "consecutive_end": 0,
             "judged_since": 0,
             "repeat_buf": deque(maxlen=max(int(self._c("repeat_max")), 2)),
             "stopped_at": 0.0,
             "stop_reason": "",
             "closing_sent_at": 0.0,
+            "farewell_sent_at": 0.0,
+            "resumed_at": 0.0,
             "peer_id": "",
             "peer_name": "",
             "judging": False,
@@ -210,33 +263,35 @@ class TopicGuard(Star):
     def _mark_dirty(self):
         self._dirty = True
 
-    def _hit_end_keywords(self, text):
-        if not text:
-            return False
-        low = text.lower()
-        for kw in self._c("end_keywords"):
-            if kw and kw.lower() in low:
-                return True
-        return False
-
     def _record_peer_msg(self, session, event, text):
         session["peer_id"] = str(event.get_sender_id() or "")
         session["peer_name"] = (event.get_sender_name() or "")[:30]
         session["last_peer_ts"] = time.time()
+        session["last_peer_text"] = text
         session["history"].append({"role": "peer", "text": text[:800], "ts": time.time()})
         session["turns"] += 1
         session["total_turns"] += 1
         self._mark_dirty()
 
-    # ---------------- 群聊防干扰：是否计入对话 ----------------
+    def _maybe_decay(self, session, text):
+        kw = self._hit_end_keywords(text)
+        perf = self._is_perfunctory(text)
+        continuing = (len(text) > int(self._c("judge_trigger_max_len"))
+                      or self._is_question(text)
+                      or (not kw and not perf))
+        if continuing:
+            session["end_ema"] *= 0.4
+            session["consecutive_end"] = 0
+
+    # ---------------- 群聊防干扰 ----------------
     def _should_track_peer_msg(self, event, session, text):
         if not event.get_group_id():
-            return True                                    # 私聊必计
+            return True
         if self._is_at_me(event):
-            return True                                    # 明确在和机器人说话
+            return True
         sender_id = str(event.get_sender_id() or "")
         if sender_id in [str(x).strip() for x in self._c("other_bot_ids") if str(x).strip()]:
-            return True                                    # 对方机器人消息必计
+            return True
         if self._c("track_all_senders"):
             return True
         window = float(self._c("engage_window_minutes")) * 60
@@ -244,19 +299,32 @@ class TopicGuard(Star):
 
     # ---------------- 新话题恢复 ----------------
     def _should_resume(self, event, session, text, is_group):
-        if not self._c("auto_resume"):
+        if not self._c("auto_resume") or not text:
             return False
-        if session.get("stopped_at") and (time.time() - session["stopped_at"]) < float(self._c("resume_cooldown_secs")):
+        # 告别类消息不恢复，防止互道再见死循环
+        if self._hit_end_keywords(text):
             return False
+        # 强信号：问句 / 请求 / @ / 关键词 —— 无视冷却直接恢复
+        strong = False
+        if self._c("resume_question_trigger") and self._is_question(text):
+            strong = True
         if self._c("resume_at_me") and self._is_at_me(event):
-            return True
-        if self._c("resume_question_trigger") and ("?" in text or "？" in text):
-            return True
+            strong = True
         for kw in self._c("resume_keywords"):
             if kw and kw in text:
+                strong = True
+                break
+        if not strong:
+            if session.get("stopped_at") and (time.time() - session["stopped_at"]) < float(self._c("resume_cooldown_secs")):
+                return False
+        if strong:
+            return True
+        if not is_group:
+            if self._c("private_auto_resume_all"):
                 return True
-        # 私聊里较长消息视为新话题；群聊为避免误唤醒不按长度恢复
-        if not is_group and len(text) >= int(self._c("resume_min_len")):
+            return len(text) >= int(self._c("resume_min_len"))
+        bot_ids = [str(x).strip() for x in self._c("other_bot_ids") if str(x).strip()]
+        if bot_ids and str(event.get_sender_id() or "") in bot_ids and len(text) >= int(self._c("resume_min_len")):
             return True
         return False
 
@@ -358,14 +426,13 @@ class TopicGuard(Star):
         return None
 
     async def _llm_judge(self, session, reason=""):
-        """后台任务：让 LLM 判定话题是否结束"""
         if session.get("judging") or session["status"] != "active":
             return
         session["judging"] = True
         try:
             provider = await self._get_provider(session)
             if provider is None:
-                logger.info("[topic_guard] 当前会话无可用 LLM Provider，跳过智能判定（仍使用沉默/重复/轮次规则）")
+                logger.info("[topic_guard] 当前会话无可用 LLM Provider，跳过智能判定")
                 return
             history_text = self._format_history(session)
             prompt = (
@@ -396,12 +463,25 @@ class TopicGuard(Star):
                 session["consecutive_end"] += 1
             else:
                 session["consecutive_end"] = 0
+
+            last_text = session.get("last_peer_text", "")
+            last_bot = session.get("last_bot_text", "")
+            kw_last = self._hit_end_keywords(last_text)
+            perf_last = self._is_perfunctory(last_text)
+            short_last = bool(last_text) and len(last_text) <= int(self._c("judge_trigger_max_len"))
+            kw_bot = self._hit_end_keywords(last_bot)
+            winddown = kw_last or kw_bot or (short_last and perf_last)
+            hard = score >= 0.9
+
             if self._c("debug_log"):
                 logger.info(f"[topic_guard] 判定 {session['cid']}: ended={ended} score={score:.2f} "
-                            f"ema={session['end_ema']:.2f} 连续={session['consecutive_end']} ({reason})")
+                            f"ema={session['end_ema']:.2f} 连续={session['consecutive_end']} "
+                            f"收尾型={winddown} ({reason})")
+
             if (session["status"] == "active"
                     and session["end_ema"] >= float(self._c("judge_threshold"))
-                    and session["consecutive_end"] >= int(self._c("judge_consecutive"))):
+                    and session["consecutive_end"] >= int(self._c("judge_consecutive"))
+                    and (winddown or hard)):
                 await self._do_stop(session, f"LLM判定：话题结束（{reason}）")
         except Exception as e:
             logger.error(f"[topic_guard] LLM 判定异常: {e}")
@@ -409,9 +489,15 @@ class TopicGuard(Star):
             session["judging"] = False
 
     # ---------------- 停止 / 恢复 / 发送 ----------------
-    async def _do_stop(self, session, reason, manual=False):
+    async def _do_stop(self, session, reason, manual=False, force=False):
         if session["status"] == "stopped":
             return
+        if not manual and not force:
+            guard = float(self._c("stop_after_resume_guard_secs"))
+            if session.get("resumed_at") and (time.time() - session["resumed_at"]) < guard:
+                if self._c("debug_log"):
+                    logger.info(f"[topic_guard] 会话 {session['cid']} 处于恢复保护期，暂不停止: {reason}")
+                return
         session["status"] = "stopped"
         session["stopped_at"] = time.time()
         session["stop_reason"] = reason
@@ -434,6 +520,7 @@ class TopicGuard(Star):
         session["repeat_buf"].clear()
         session["history"].clear()
         session["stop_reason"] = ""
+        session["resumed_at"] = time.time()
         if was_stopped:
             logger.info(f"[topic_guard] 会话 {session['cid']} 已恢复: {reason}")
             notice = str(self._c("resume_notice")).strip()
@@ -580,11 +667,17 @@ class TopicGuard(Star):
                 return
             self._ensure_sweeper()
             session = self._ensure_session(event)
-            text = (event.message_str or "").strip()
+            text = self._clean_text(event.message_str)
+            if not text:
+                return  # 输入中/纯图片/纯引用等事件不参与任何判定
             is_group = bool(event.get_group_id())
 
-            # 已停止：尝试检测新话题
             if session["status"] == "stopped":
+                if self._hit_end_keywords(text):
+                    reply = str(self._c("farewell_reply")).strip()
+                    if reply and (time.time() - session.get("farewell_sent_at", 0) >= float(self._c("closing_cooldown"))):
+                        session["farewell_sent_at"] = time.time()
+                        await self._safe_send(session, reply)
                 if self._should_resume(event, session, text, is_group):
                     await self._do_resume(session, "检测到新话题")
                     self._record_peer_msg(session, event, text)
@@ -596,27 +689,27 @@ class TopicGuard(Star):
                 return
 
             self._record_peer_msg(session, event, text)
+            self._maybe_decay(session, text)
 
-            # 1) 最大轮次保护
             max_turns = int(self._c("max_turns"))
             if max_turns > 0 and session["turns"] >= max_turns:
-                await self._do_stop(session, f"达到最大轮次({max_turns})")
+                await self._do_stop(session, f"达到最大轮次({max_turns})", force=True)
                 return
 
-            # 2) 车轱辘话快速通道
-            if self._check_repeat(session, text):
-                await self._do_stop(session, "连续重复内容（疑似车轱辘话）")
+            if len(text) >= 2 and self._check_repeat(session, text):
+                await self._do_stop(session, "连续重复内容（疑似车轱辘话）", force=True)
                 return
 
-            # 3) LLM 判定触发条件
-            if (self._c("llm_judge_enable")
-                    and session["turns"] >= int(self._c("min_turns_before_stop"))
-                    and not session["judging"]):
+            if self._c("llm_judge_enable") and session["turns"] >= int(self._c("min_turns_before_stop")) and not session["judging"]:
                 kw_hit = self._hit_end_keywords(text)
                 short = len(text) <= int(self._c("judge_trigger_max_len"))
+                last_bot = session.get("last_bot_text", "")
+                mutual = short and bool(last_bot) and len(last_bot) <= int(self._c("judge_bot_reply_max_len"))
                 interval_hit = (session["turns"] - session["judged_since"]) >= int(self._c("judge_interval"))
-                if kw_hit or short or interval_hit:
-                    reason = "命中结束关键词" if kw_hit else ("对方短消息" if short else "轮次间隔")
+                throttle_ok = (time.time() - session.get("last_judge_ts", 0)) >= float(self._c("judge_min_interval_secs"))
+                if (kw_hit or mutual or interval_hit) and throttle_ok:
+                    session["last_judge_ts"] = time.time()
+                    reason = "命中结束关键词" if kw_hit else ("双方短回复" if mutual else "轮次间隔")
                     asyncio.create_task(self._llm_judge(session, reason))
         except Exception as e:
             logger.error(f"[topic_guard] 消息处理异常: {e}")
@@ -629,11 +722,10 @@ class TopicGuard(Star):
     async def on_private_message(self, event: AstrMessageEvent):
         await self._handle_message(event)
 
-    # 话题结束后拦截 LLM 回复，让机器人保持静默
     @filter.on_llm_request()
     async def hook_on_llm_request(self, event: AstrMessageEvent, _req):
         try:
-            if not self._enabled() or self._is_self(event):
+            if not self._enabled() or self._is_self(event) or not self._c("block_when_stopped"):
                 return
             session = self.sessions.get(self._conv_id(event))
             if session and session["status"] == "stopped":
@@ -641,7 +733,6 @@ class TopicGuard(Star):
         except Exception as e:
             logger.error(f"[topic_guard] on_llm_request 异常: {e}")
 
-    # 记录机器人自己的回复，并判断是否在收尾
     @filter.on_llm_response()
     async def hook_on_llm_response(self, event: AstrMessageEvent, resp):
         try:
@@ -655,17 +746,18 @@ class TopicGuard(Star):
                 return
             session["history"].append({"role": "bot", "text": text[:800], "ts": time.time()})
             session["last_bot_ts"] = time.time()
+            session["last_bot_text"] = text
             self._mark_dirty()
             if not (self._c("judge_bot_reply") and self._c("llm_judge_enable")):
                 return
             if session["turns"] < int(self._c("min_turns_before_stop")):
                 return
-            if len(text) > int(self._c("judge_bot_reply_max_len")):
-                return
             kw_hit = self._hit_end_keywords(text)
             interval_hit = (session["turns"] - session["judged_since"]) >= int(self._c("judge_interval"))
-            if (kw_hit or interval_hit) and not session["judging"]:
-                asyncio.create_task(self._llm_judge(session, "机器人回复疑似收尾" if kw_hit else "机器人短回复"))
+            throttle_ok = (time.time() - session.get("last_judge_ts", 0)) >= float(self._c("judge_min_interval_secs"))
+            if (kw_hit or interval_hit) and throttle_ok and not session["judging"]:
+                session["last_judge_ts"] = time.time()
+                asyncio.create_task(self._llm_judge(session, "机器人回复疑似收尾" if kw_hit else "轮次间隔"))
         except Exception as e:
             logger.error(f"[topic_guard] on_llm_response 异常: {e}")
 
