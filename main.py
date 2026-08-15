@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-AstrBot 插件：话题守卫（topic_guard）v1.3
+AstrBot 插件：话题守卫（topic_guard）v1.4
 自动检测对话话题是否结束并主动停止对话。
-v1.3 变更：双向循环检测（车轱辘话）：双方消息共同参与比对，新消息与窗口内
-≥ loop_match_min 条相似（≥loop_similarity）即停止；机器人重复回复同样触发。
-核心原则：宁可不结束，绝不乱结束；但死循环必须打断。
+v1.4 变更：新增快速重复检测（对方第二次发几乎相同的话立即停止）+ 引用前缀剥离增强。
+核心原则：宁可不结束，绝不乱结束；但死循环必须尽快打断。
 """
 import asyncio
 import difflib
@@ -53,6 +52,8 @@ DEFAULT_RESUME_KEYWORDS = ["在吗", "在不在", "在么", "新话题", "问个
 
 DEFAULT_PERFUNCTORY = ["嗯", "嗯嗯", "哦", "哦哦", "好", "好的", "好吧", "哈哈", "呵呵", "是", "是的", "对", "没错", "行", "可以", "ok", "okay", "收到", "了解", "知道了", "嗯呐", "额", "呃"]
 
+DEFAULT_LOOP_FAST_IGNORE = ["你好", "您好", "在吗", "谢谢", "多谢", "早上好", "中午好", "晚上好", "晚安", "再见", "拜拜"]
+
 DEFAULT_CLOSING = "🌙 这个话题聊得差不多啦，我先去待机了～有新话题随时喊我！"
 
 DEFAULT_LOOP_STOP = "🔁 检测到对话在重复循环，我先停一下～换个话题或发送 /tresume 继续。"
@@ -75,6 +76,10 @@ DEFAULTS = {
     "silence_enable": True,
     "silence_minutes": 10,
     "silence_check_interval": 30,
+    "loop_fast_enable": True,
+    "loop_fast_similarity": 0.9,
+    "loop_fast_match_min": 1,
+    "loop_fast_ignore": DEFAULT_LOOP_FAST_IGNORE,
     "loop_enable": True,
     "loop_similarity": 0.65,
     "loop_match_min": 2,
@@ -114,7 +119,6 @@ class TopicGuard(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.cfg = config if isinstance(config, dict) else {}
-        # 配置为分组结构，这里拍平方便读取
         self.cfg_flat = {}
         for v in self.cfg.values():
             if isinstance(v, dict):
@@ -181,8 +185,13 @@ class TopicGuard(Star):
 
     def _clean_text(self, raw):
         t = (raw or "").strip()
-        t = re.sub(r"^\[[^\[\]]{1,80}\]\s*", "", t)
-        t = re.sub(r"^【[^【】]{1,80}】\s*", "", t)
+        # 循环剥离开头的引用块（可能多层、含嵌套括号）
+        for _ in range(3):
+            new = re.sub(r"^\[[^\]]*\]\s*", "", t)
+            new = re.sub(r"^【[^】]*】\s*", "", new)
+            if new == t:
+                break
+            t = new
         return t.strip()
 
     def _is_question(self, text):
@@ -234,6 +243,7 @@ class TopicGuard(Star):
             "status": "active",
             "history": deque(maxlen=max(int(self._c("history_max")), 2)),
             "loop_buf": deque(maxlen=max(int(self._c("loop_window")), 2)),
+            "loop_fast_buf": deque(maxlen=max(int(self._c("loop_window")), 2)),
             "turns": 0,
             "total_turns": 0,
             "last_peer_ts": 0.0,
@@ -332,9 +342,33 @@ class TopicGuard(Star):
             return True
         return False
 
+    # ---------------- 快速重复检测（对方几乎重复发言） ----------------
+    def _check_loop_fast(self, session, text):
+        if not self._c("loop_fast_enable"):
+            return False
+        t = text.strip()
+        if len(t) < 2:
+            return False
+        ignore = [str(x).strip() for x in self._c("loop_fast_ignore") if str(x).strip()]
+        if t in ignore:
+            return False
+        sim = float(self._c("loop_fast_similarity"))
+        need = int(self._c("loop_fast_match_min"))
+        matches = 0
+        for old in session["loop_fast_buf"]:
+            try:
+                r = difflib.SequenceMatcher(None, t, old).ratio()
+            except Exception:
+                continue
+            if r >= sim:
+                matches += 1
+                if matches >= need:
+                    break
+        session["loop_fast_buf"].append(t)
+        return matches >= need
+
     # ---------------- 双向循环检测（车轱辘话） ----------------
     def _check_loop(self, session, text):
-        """新消息与循环窗口内 ≥loop_match_min 条消息相似（≥loop_similarity）即判定为循环"""
         if not self._c("loop_enable"):
             return False
         t = text.strip()
@@ -524,6 +558,7 @@ class TopicGuard(Star):
         session["turns"] = 0
         session["judged_since"] = 0
         session["loop_buf"].clear()
+        session["loop_fast_buf"].clear()
         session["history"].clear()
         session["stop_reason"] = ""
         session["resumed_at"] = time.time()
@@ -675,7 +710,7 @@ class TopicGuard(Star):
             session = self._ensure_session(event)
             text = self._clean_text(event.message_str)
             if not text:
-                return  # 输入中/纯图片/纯引用等事件不参与任何判定
+                return
             is_group = bool(event.get_group_id())
 
             if session["status"] == "stopped":
@@ -697,19 +732,25 @@ class TopicGuard(Star):
             self._record_peer_msg(session, event, text)
             self._maybe_decay(session, text)
 
-            # 1) 双向循环检测（车轱辘话）：优先于一切，直接打断
+            # 1) 快速重复检测：第二次发几乎一样的话就停
+            if self._check_loop_fast(session, text):
+                await self._do_stop(session, "检测到快速重复（对方重复发言）", force=True,
+                                    closing_text=str(self._c("loop_stop_message")) or None)
+                return
+
+            # 2) 双向循环检测：变体重复（阈值更低，需多条命中）
             if self._check_loop(session, text):
                 await self._do_stop(session, "检测到重复循环（车轱辘话）", force=True,
                                     closing_text=str(self._c("loop_stop_message")) or None)
                 return
 
-            # 2) 最大轮次保护
+            # 3) 最大轮次保护
             max_turns = int(self._c("max_turns"))
             if max_turns > 0 and session["turns"] >= max_turns:
                 await self._do_stop(session, f"达到最大轮次({max_turns})", force=True)
                 return
 
-            # 3) LLM 判定触发
+            # 4) LLM 判定触发
             if self._c("llm_judge_enable") and session["turns"] >= int(self._c("min_turns_before_stop")) and not session["judging"]:
                 kw_hit = self._hit_end_keywords(text)
                 short = len(text) <= int(self._c("judge_trigger_max_len"))
@@ -759,7 +800,6 @@ class TopicGuard(Star):
             session["last_bot_text"] = text
             self._mark_dirty()
 
-            # 机器人自己的回复也参与循环检测（重复回复同样打断）
             if self._check_loop(session, text):
                 await self._do_stop(session, "检测到重复循环（机器人重复回复）", force=True,
                                     closing_text=str(self._c("loop_stop_message")) or None)
