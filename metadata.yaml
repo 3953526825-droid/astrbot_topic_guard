@@ -1,8 +1,8 @@
 name: topic_guard
 display_name: 话题守卫（自动话题结束检测）
-desc: 自动检测对话话题是否结束并主动停止对话，支持双机器人互聊与人机对聊。LLM 智能判定 + 多重防误判（新内容衰减、收尾门控、判定节流、恢复保护），沉默超时/重复内容/轮次上限兜底，新话题自动恢复。
-short_desc: 让机器人自己判断"聊完了吗"，聊完自动收尾静默，不会误杀进行中的对话。
-version: v1.2.0
+desc: 自动检测对话话题是否结束并主动停止对话，支持双机器人互聊与人机对聊。LLM 智能判定 + 双向循环检测（车轱辘话）+ 多重防误判，沉默超时/轮次上限兜底，新话题自动恢复。
+short_desc: 让机器人自己判断"聊完了吗"，聊完自动收尾静默，能识别重复循环并主动打断。
+version: v1.3.0
 repo: https://github.com/yourname/astrbot-plugin-topic-guard
 author: you
 support_platforms:
