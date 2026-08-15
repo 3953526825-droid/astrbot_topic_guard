@@ -5,7 +5,7 @@
     "items": {
       "enable": {"description": "总开关", "type": "bool", "default": true, "hint": "插件的总开关。关闭后不再做任何话题判定与拦截。"},
       "block_when_stopped": {"description": "结束后拦截", "type": "bool", "default": true, "hint": "话题结束后拦截机器人回复，让它保持静默。若只想记录状态不拦截（排查问题时），可关闭。"},
-      "debug_log": {"description": "调试日志", "type": "bool", "default": false, "hint": "每次 LLM 判定结果（ended/score/ema/收尾型）与停止、恢复、循环检测都会打印到 AstrBot 日志。排查时开启。"}
+      "debug_log": {"description": "调试日志", "type": "bool", "default": false, "hint": "每次 LLM 判定结果与停止、恢复、循环检测都会打印到 AstrBot 日志。排查时开启。"}
     }
   },
   "judge": {
@@ -30,25 +30,29 @@
   "stop": {
     "description": "🛑 停止条件",
     "type": "object",
-    "hint": "循环检测针对『反复问同一问题/反复回同一句话』的死循环场景，双方消息都会参与比对。",
+    "hint": "快速重复检测：对方第二次发几乎一样的话就停（默认相似度0.9）；循环检测：新消息与窗口内多条相似就停，负责变体重复。想更快就把相似度调低。",
     "items": {
       "silence_enable": {"description": "沉默超时", "type": "bool", "default": true, "hint": "双方都沉默一段时间后自动结束话题。"},
       "silence_minutes": {"description": "沉默分钟", "type": "int", "default": 10, "hint": "双方均沉默多少分钟后判定话题结束。人机场景建议 10~30；双机器人互聊建议 5。"},
       "silence_check_interval": {"description": "巡检间隔秒", "type": "int", "default": 30, "hint": "后台巡检间隔（秒），也用于状态落盘与 TTL 恢复检查。"},
-      "loop_enable": {"description": "循环检测", "type": "bool", "default": true, "hint": "检测机械重复（车轱辘话）：对方或机器人反复发相同/高度相似内容时直接停止。针对互问互答陷入死循环的场景，建议开启。"},
-      "loop_similarity": {"description": "循环相似度", "type": "float", "default": 0.65, "hint": "与历史消息的相似度 ≥ 该值视为重复。0.6~0.7 较合适；越低越敏感（如“又让你带画”vs“那个让你带话”约0.55，“那个让你带话”vs“又让你带话”约0.73）。"},
-      "loop_match_min": {"description": "重复命中数", "type": "int", "default": 2, "hint": "新消息与最近循环窗口内 ≥ 该条数相似，即判定循环并停止。建议 2~3。"},
+      "loop_fast_enable": {"description": "快速重复检测", "type": "bool", "default": true, "hint": "对方连续发几乎一模一样的话（如第二次重复同一问题）立即停止，不用等第三次。针对『反复问同一句话』，建议开启。"},
+      "loop_fast_similarity": {"description": "快速相似度", "type": "float", "default": 0.9, "hint": "与最近对方消息相似度 ≥ 该值即触发。0.9=几乎完全一样（最安全）；0.7=较相似；0.55=很激进（“又让你带画”vs“那个让你带话”约0.545，会第1次就停）。"},
+      "loop_fast_match_min": {"description": "快速命中数", "type": "int", "default": 1, "hint": "与最近几条对方消息中 ≥ 该条数相似即停。默认1=第二次重复就停。"},
+      "loop_fast_ignore": {"description": "快速忽略词", "type": "list", "items": {"type": "string"}, "default": ["你好", "您好", "在吗", "谢谢", "多谢", "早上好", "中午好", "晚上好", "晚安", "再见", "拜拜"], "hint": "这些常见寒暄词不参与快速重复检测（防止“你好你好”这类正常寒暄误触发）。完整词匹配。"},
+      "loop_enable": {"description": "循环检测", "type": "bool", "default": true, "hint": "检测机械重复（车轱辘话）：对方或机器人反复发相同/高度相似内容时直接停止。负责变体重复（阈值更低，需多条命中），建议开启。"},
+      "loop_similarity": {"description": "循环相似度", "type": "float", "default": 0.65, "hint": "与历史消息的相似度 ≥ 该值视为重复。0.6~0.7 较合适；越低越敏感（如“那个让你带话”vs“又让你带话”约0.73）。"},
+      "loop_match_min": {"description": "重复命中数", "type": "int", "default": 2, "hint": "新消息与最近循环窗口内 ≥ 该条数相似，即判定循环并停止。改成1可更快触发，但正常聊天可能误停。"},
       "loop_window": {"description": "循环窗口", "type": "int", "default": 8, "hint": "参与比对的历史消息条数（对方和机器人双方的消息都算）。"},
-      "loop_stop_message": {"description": "循环停止语", "type": "string", "default": "🔁 检测到对话在重复循环，我先停一下～换个话题或发送 /tresume 继续。", "hint": "因循环而停止时发送这句话（而不是普通结束语）。留空则使用普通结束语。"},
+      "loop_stop_message": {"description": "循环停止语", "type": "string", "default": "🔁 检测到对话在重复循环，我先停一下～换个话题或发送 /tresume 继续。", "hint": "因重复/循环而停止时发送这句话（而不是普通结束语）。留空则使用普通结束语。"},
       "max_turns": {"description": "最大轮次", "type": "int", "default": 30, "hint": "单轮话题最多让对方发这么多条消息，达到即结束。0=关闭。"},
-      "min_turns_before_stop": {"description": "最少消息数", "type": "int", "default": 2, "hint": "对方至少发过 N 条消息才允许 LLM 判定结束，防止刚打招呼就被停。循环检测不受此限制。"}
+      "min_turns_before_stop": {"description": "最少消息数", "type": "int", "default": 2, "hint": "对方至少发过 N 条消息才允许 LLM 判定结束。循环/快速重复检测不受此限制。"}
     }
   },
   "closing": {
     "description": "💬 结束动作",
     "type": "object",
     "items": {
-      "closing_mode": {"description": "结束动作", "type": "string", "options": ["silent", "message", "summary"], "labels": ["静默停止", "发结束语", "总结后结束"], "default": "message", "hint": "silent=什么都不发直接静默；message=发一句结束语；summary=先让 LLM 总结本次对话再发结束语（多花一次 token）。双机器人对聊担心互相道别刷屏可选 silent。"},
+      "closing_mode": {"description": "结束动作", "type": "string", "options": ["silent", "message", "summary"], "labels": ["静默停止", "发结束语", "总结后结束"], "default": "message", "hint": "silent=什么都不发直接静默；message=发一句结束语；summary=先让 LLM 总结本次对话再发结束语（多花一次 token）。"},
       "closing_message": {"description": "结束语", "type": "string", "default": "🌙 这个话题聊得差不多啦，我先去待机了～有新话题随时喊我！", "hint": "结束语内容。closing_mode 为 silent 时不发送。"},
       "closing_cooldown": {"description": "结束语冷却", "type": "int", "default": 300, "hint": "结束语/告别回复的最小间隔（秒），防止刷屏。"},
       "farewell_reply": {"description": "告别回复", "type": "string", "default": "", "hint": "已停止状态下，对方再说告别话时回复这一句（不恢复对话）。留空=不回复。"},
@@ -61,14 +65,14 @@
     "hint": "停止后如何重新醒过来。问句 / 请求 / @ / 恢复关键词属于强信号，无视冷却直接恢复，绝不会拦你的提问。",
     "items": {
       "auto_resume": {"description": "自动恢复", "type": "bool", "default": true, "hint": "新话题自动恢复开关。关闭后只能 /tresume 手动恢复。"},
-      "private_auto_resume_all": {"description": "私聊任意恢复", "type": "bool", "default": true, "hint": "私聊中对方发任何非告别内容都视为想继续聊并恢复。强烈建议开启，防止误停后机器人装死。"},
-      "resume_question_trigger": {"description": "问句恢复", "type": "bool", "default": true, "hint": "对方发问句/请求（含？吗呢么谁哪怎么等）立即恢复，且不受冷却限制。"},
+      "private_auto_resume_all": {"description": "私聊任意恢复", "type": "bool", "default": true, "hint": "私聊中对方发任何非告别内容都视为想继续聊并恢复。强烈建议开启。"},
+      "resume_question_trigger": {"description": "问句恢复", "type": "bool", "default": true, "hint": "对方发问句/请求立即恢复，且不受冷却限制。"},
       "resume_keywords": {"description": "恢复关键词", "type": "list", "items": {"type": "string"}, "default": ["在吗", "在不在", "在么", "新话题", "问个问题", "帮我", "你好", "hello", "hi", "呼叫"], "hint": "命中即恢复，且不受冷却限制。"},
       "resume_at_me": {"description": "@我恢复", "type": "bool", "default": true, "hint": "被 @ 立即恢复，且不受冷却限制。"},
       "resume_min_len": {"description": "恢复长度", "type": "int", "default": 8, "hint": "群聊中对方机器人消息长度 ≥ 该值视为新话题；私聊关闭『私聊任意恢复』后才使用长度规则。"},
-      "resume_cooldown_secs": {"description": "恢复冷却秒", "type": "int", "default": 5, "hint": "停止后 N 秒内弱信号（长度类）不触发恢复，防抖动。强信号（问句/请求/@/关键词）不受此限制。建议 3~10。"},
+      "resume_cooldown_secs": {"description": "恢复冷却秒", "type": "int", "default": 5, "hint": "停止后 N 秒内弱信号不触发恢复。强信号（问句/请求/@/关键词）不受此限制。"},
       "stop_after_resume_guard_secs": {"description": "恢复保护期", "type": "int", "default": 30, "hint": "恢复对话后 N 秒内禁止再次自动停止，防止停止/恢复来回跳。"},
-      "stop_ttl_minutes": {"description": "TTL强恢复", "type": "int", "default": 60, "hint": "停止多少分钟后强制自动恢复（兜底，防止永久静默）。0=关闭。"},
+      "stop_ttl_minutes": {"description": "TTL强恢复", "type": "int", "default": 60, "hint": "停止多少分钟后强制自动恢复。0=关闭。"},
       "resume_notice": {"description": "恢复提示语", "type": "string", "default": "", "hint": "恢复对话时发送的提示语，留空则不发送。"}
     }
   },
