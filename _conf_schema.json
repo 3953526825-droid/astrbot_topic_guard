@@ -5,7 +5,7 @@
     "items": {
       "enable": {"description": "总开关", "type": "bool", "default": true, "hint": "插件的总开关。关闭后不再做任何话题判定与拦截。"},
       "block_when_stopped": {"description": "结束后拦截", "type": "bool", "default": true, "hint": "话题结束后拦截机器人回复，让它保持静默。若只想记录状态不拦截（排查问题时），可关闭。"},
-      "debug_log": {"description": "调试日志", "type": "bool", "default": false, "hint": "每次 LLM 判定结果（ended/score/ema/收尾型）与停止、恢复原因都会打印到 AstrBot 日志。排查误判时开启。"}
+      "debug_log": {"description": "调试日志", "type": "bool", "default": false, "hint": "每次 LLM 判定结果（ended/score/ema/收尾型）与停止、恢复、循环检测都会打印到 AstrBot 日志。排查时开启。"}
     }
   },
   "judge": {
@@ -13,7 +13,7 @@
     "type": "object",
     "hint": "核心功能：让 LLM 判断话题是否聊完。为防误判，必须同时满足：连续多次判定结束 + 结束倾向 EMA 超阈值 + 最后一条消息是收尾型（告别词/敷衍词），才真正停止。",
     "items": {
-      "llm_judge_enable": {"description": "智能判定", "type": "bool", "default": true, "hint": "关闭后只使用沉默超时 / 重复内容 / 轮次上限等规则。"},
+      "llm_judge_enable": {"description": "智能判定", "type": "bool", "default": true, "hint": "关闭后只使用沉默超时 / 循环检测 / 轮次上限等规则。"},
       "judge_model": {"description": "判定模型", "type": "string", "default": "", "hint": "留空=使用当前会话默认模型；可填一个便宜模型的名字来省 token。"},
       "judge_threshold": {"description": "结束阈值", "type": "float", "default": 0.7, "hint": "结束倾向 EMA（0~1）达到该值且连续判定结束才可能停止。调高更保守。"},
       "judge_consecutive": {"description": "连续次数", "type": "int", "default": 2, "hint": "连续多少次判定为『已结束』才真正停止。越大越保守，建议 ≥2。"},
@@ -22,7 +22,7 @@
       "judge_interval": {"description": "兜底轮次", "type": "int", "default": 3, "hint": "每 N 条对方消息强制判定一次（兜底检查，防止漏判）。"},
       "judge_bot_reply": {"description": "也判自己", "type": "bool", "default": true, "hint": "机器人自己说了再见/晚安等收尾话时也触发判定。"},
       "judge_bot_reply_max_len": {"description": "自己短阈值", "type": "int", "default": 60, "hint": "机器人回复长度 ≤ 该值视为短回复。"},
-      "judge_system_prompt": {"description": "判定提示词", "type": "text", "default": "你是一个「对话话题状态检测器」。你的任务：判断给定的一段对话是否已经自然聊完、可以收尾停止。\n判定为「已结束」的典型情形：\n1. 双方在互相告别或客套收尾，例如“好的再见”“下次聊”“谢谢，没别的问题了”。\n2. 对方提出的问题已经被解决，且没有再提出新问题或新需求。\n3. 双方都只是在敷衍回应（如连续“嗯”“好的”“哈哈”），没有任何一方再提出新内容。\n4. 对方明确表示要离开、下线、去忙别的。\n判定为「未结束」的典型情形：\n1. 对方提出了新问题、新话题，或明显还想继续聊。\n2. 对方正在表达情绪、观点或展开叙述。\n3. 对话中仍有未完成的任务。\n特别提醒：只要「对方」还在持续提出新内容——哪怕消息很短，例如“好饿”“谁让你带话”“要不你再发一遍”——都必须判定为「未结束」。宁可保守一点，没有把握时判为未结束。\n你必须只输出一个 JSON 对象，不要输出任何其他文字，格式：{\"ended\": true 或 false, \"score\": 0到1的小数, \"reason\": \"一句话理由\"}", "hint": "判定用的系统提示词。一般不用改；想更保守可加重“宁可判未结束”的表述。"},
+      "judge_system_prompt": {"description": "判定提示词", "type": "text", "default": "你是一个「对话话题状态检测器」。你的任务：判断给定的一段对话是否已经自然聊完、可以收尾停止。\n判定为「已结束」的典型情形：\n1. 双方在互相告别或客套收尾，例如“好的再见”“下次聊”“谢谢，没别的问题了”。\n2. 对方提出的问题已经被解决，且没有再提出新问题或新需求。\n3. 双方都只是在敷衍回应（如连续“嗯”“好的”“哈哈”），没有任何一方再提出新内容。\n4. 对方明确表示要离开、下线、去忙别的。\n5. 对话陷入机械循环：对方反复重复同一问题、或双方反复给出相同/类似的回复（车轱辘话），说明对话已无进展。\n判定为「未结束」的典型情形：\n1. 对方提出了全新的问题或新话题，或明显还想继续聊。\n2. 对方正在表达情绪、观点或展开叙述。\n3. 对话中仍有未完成的任务。\n特别提醒：对方提出的是全新内容时必须判未结束；只有对方在机械重复同一内容时才可结合第5条判已结束。宁可保守一点，没有把握时判为未结束。\n你必须只输出一个 JSON 对象，不要输出任何其他文字，格式：{\"ended\": true 或 false, \"score\": 0到1的小数, \"reason\": \"一句话理由\"}", "hint": "判定用的系统提示词。一般不用改；想更保守可加重“宁可判未结束”的表述。"},
       "end_keywords": {"description": "结束关键词", "type": "list", "items": {"type": "string"}, "default": ["再见", "拜拜", "下次聊", "下次再聊", "改天聊", "回头聊", "先这样", "就到这", "不聊了", "告辞", "晚安", "886", "goodbye", "bye"], "hint": "仅用于触发判定与收尾门控，不会直接判定结束。"},
       "perfunctory_words": {"description": "敷衍词表", "type": "list", "items": {"type": "string"}, "default": ["嗯", "嗯嗯", "哦", "哦哦", "好", "好的", "好吧", "哈哈", "呵呵", "是", "是的", "对", "没错", "行", "可以", "ok", "okay", "收到", "了解", "知道了", "嗯呐", "额", "呃"], "hint": "命中这些词的消息不视为『新内容』，不会作废已积累的结束票。"}
     }
@@ -30,15 +30,18 @@
   "stop": {
     "description": "🛑 停止条件",
     "type": "object",
+    "hint": "循环检测针对『反复问同一问题/反复回同一句话』的死循环场景，双方消息都会参与比对。",
     "items": {
       "silence_enable": {"description": "沉默超时", "type": "bool", "default": true, "hint": "双方都沉默一段时间后自动结束话题。"},
       "silence_minutes": {"description": "沉默分钟", "type": "int", "default": 10, "hint": "双方均沉默多少分钟后判定话题结束。人机场景建议 10~30；双机器人互聊建议 5。"},
       "silence_check_interval": {"description": "巡检间隔秒", "type": "int", "default": 30, "hint": "后台巡检间隔（秒），也用于状态落盘与 TTL 恢复检查。"},
-      "repeat_enable": {"description": "重复检测", "type": "bool", "default": true, "hint": "对方连续发高相似内容（车轱辘话）直接结束。"},
-      "repeat_similarity": {"description": "相似度阈值", "type": "float", "default": 0.85, "hint": "两条消息相似度 ≥ 该值视为重复。"},
-      "repeat_max": {"description": "重复次数", "type": "int", "default": 3, "hint": "连续 N 条高相似消息判定为车轱辘话并结束。"},
+      "loop_enable": {"description": "循环检测", "type": "bool", "default": true, "hint": "检测机械重复（车轱辘话）：对方或机器人反复发相同/高度相似内容时直接停止。针对互问互答陷入死循环的场景，建议开启。"},
+      "loop_similarity": {"description": "循环相似度", "type": "float", "default": 0.65, "hint": "与历史消息的相似度 ≥ 该值视为重复。0.6~0.7 较合适；越低越敏感（如“又让你带画”vs“那个让你带话”约0.55，“那个让你带话”vs“又让你带话”约0.73）。"},
+      "loop_match_min": {"description": "重复命中数", "type": "int", "default": 2, "hint": "新消息与最近循环窗口内 ≥ 该条数相似，即判定循环并停止。建议 2~3。"},
+      "loop_window": {"description": "循环窗口", "type": "int", "default": 8, "hint": "参与比对的历史消息条数（对方和机器人双方的消息都算）。"},
+      "loop_stop_message": {"description": "循环停止语", "type": "string", "default": "🔁 检测到对话在重复循环，我先停一下～换个话题或发送 /tresume 继续。", "hint": "因循环而停止时发送这句话（而不是普通结束语）。留空则使用普通结束语。"},
       "max_turns": {"description": "最大轮次", "type": "int", "default": 30, "hint": "单轮话题最多让对方发这么多条消息，达到即结束。0=关闭。"},
-      "min_turns_before_stop": {"description": "最少消息数", "type": "int", "default": 2, "hint": "对方至少发过 N 条消息才允许判定结束，防止刚打招呼就被停。"}
+      "min_turns_before_stop": {"description": "最少消息数", "type": "int", "default": 2, "hint": "对方至少发过 N 条消息才允许 LLM 判定结束，防止刚打招呼就被停。循环检测不受此限制。"}
     }
   },
   "closing": {
