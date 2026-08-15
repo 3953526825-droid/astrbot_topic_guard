@@ -1,0 +1,10 @@
+name: topic_guard
+display_name: 话题守卫（自动话题结束检测）
+desc: 自动检测对话话题是否结束并主动停止对话，支持双机器人互聊与人机对聊。核心为 LLM 智能判定（告别、问题解决、敷衍收尾等），辅以沉默超时、重复内容检测、轮次上限；支持新话题自动恢复、手动指令、统计与对话总结。
+short_desc: 让机器人自己判断"聊完了吗"，聊完自动收尾静默。
+version: v1.0.0
+repo: https://github.com/yourname/astrbot-plugin-topic-guard
+author: you
+support_platforms:
+  - aiocqhttp
+  - qq_official
