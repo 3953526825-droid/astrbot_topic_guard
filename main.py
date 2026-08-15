@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-AstrBot 插件：话题守卫（topic_guard）v1.2
+AstrBot 插件：话题守卫（topic_guard）v1.3
 自动检测对话话题是否结束并主动停止对话。
-v1.2 变更：配置改为分组结构；问句/请求/@/关键词为强恢复信号（无视冷却）。
-核心原则：宁可不结束，绝不乱结束。
+v1.3 变更：双向循环检测（车轱辘话）：双方消息共同参与比对，新消息与窗口内
+≥ loop_match_min 条相似（≥loop_similarity）即停止；机器人重复回复同样触发。
+核心原则：宁可不结束，绝不乱结束；但死循环必须打断。
 """
 import asyncio
 import difflib
@@ -34,11 +35,12 @@ DEFAULT_JUDGE_SYSTEM_PROMPT = (
     "2. 对方提出的问题已经被解决，且没有再提出新问题或新需求。\n"
     "3. 双方都只是在敷衍回应（如连续“嗯”“好的”“哈哈”），没有任何一方再提出新内容。\n"
     "4. 对方明确表示要离开、下线、去忙别的。\n"
+    "5. 对话陷入机械循环：对方反复重复同一问题、或双方反复给出相同/类似的回复（车轱辘话），说明对话已无进展。\n"
     "判定为「未结束」的典型情形：\n"
-    "1. 对方提出了新问题、新话题，或明显还想继续聊。\n"
+    "1. 对方提出了全新的问题或新话题，或明显还想继续聊。\n"
     "2. 对方正在表达情绪、观点或展开叙述。\n"
     "3. 对话中仍有未完成的任务。\n"
-    "特别提醒：只要「对方」还在持续提出新内容——哪怕消息很短，例如“好饿”“谁让你带话”“要不你再发一遍”——都必须判定为「未结束」。宁可保守一点，没有把握时判为未结束。\n"
+    "特别提醒：对方提出的是全新内容时必须判未结束；只有对方在机械重复同一内容时才可结合第5条判已结束。宁可保守一点，没有把握时判为未结束。\n"
     "你必须只输出一个 JSON 对象，不要输出任何其他文字，格式："
     '{"ended": true 或 false, "score": 0到1的小数, "reason": "一句话理由"}'
 )
@@ -52,6 +54,8 @@ DEFAULT_RESUME_KEYWORDS = ["在吗", "在不在", "在么", "新话题", "问个
 DEFAULT_PERFUNCTORY = ["嗯", "嗯嗯", "哦", "哦哦", "好", "好的", "好吧", "哈哈", "呵呵", "是", "是的", "对", "没错", "行", "可以", "ok", "okay", "收到", "了解", "知道了", "嗯呐", "额", "呃"]
 
 DEFAULT_CLOSING = "🌙 这个话题聊得差不多啦，我先去待机了～有新话题随时喊我！"
+
+DEFAULT_LOOP_STOP = "🔁 检测到对话在重复循环，我先停一下～换个话题或发送 /tresume 继续。"
 
 DEFAULTS = {
     "enable": True,
@@ -71,9 +75,11 @@ DEFAULTS = {
     "silence_enable": True,
     "silence_minutes": 10,
     "silence_check_interval": 30,
-    "repeat_enable": True,
-    "repeat_similarity": 0.85,
-    "repeat_max": 3,
+    "loop_enable": True,
+    "loop_similarity": 0.65,
+    "loop_match_min": 2,
+    "loop_window": 8,
+    "loop_stop_message": DEFAULT_LOOP_STOP,
     "max_turns": 30,
     "min_turns_before_stop": 2,
     "closing_mode": "message",
@@ -108,7 +114,7 @@ class TopicGuard(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.cfg = config if isinstance(config, dict) else {}
-        # v1.2：配置改为分组结构，这里拍平方便读取
+        # 配置为分组结构，这里拍平方便读取
         self.cfg_flat = {}
         for v in self.cfg.values():
             if isinstance(v, dict):
@@ -227,6 +233,7 @@ class TopicGuard(Star):
             "umo": umo,
             "status": "active",
             "history": deque(maxlen=max(int(self._c("history_max")), 2)),
+            "loop_buf": deque(maxlen=max(int(self._c("loop_window")), 2)),
             "turns": 0,
             "total_turns": 0,
             "last_peer_ts": 0.0,
@@ -237,7 +244,6 @@ class TopicGuard(Star):
             "end_ema": 0.0,
             "consecutive_end": 0,
             "judged_since": 0,
-            "repeat_buf": deque(maxlen=max(int(self._c("repeat_max")), 2)),
             "stopped_at": 0.0,
             "stop_reason": "",
             "closing_sent_at": 0.0,
@@ -301,10 +307,8 @@ class TopicGuard(Star):
     def _should_resume(self, event, session, text, is_group):
         if not self._c("auto_resume") or not text:
             return False
-        # 告别类消息不恢复，防止互道再见死循环
         if self._hit_end_keywords(text):
             return False
-        # 强信号：问句 / 请求 / @ / 关键词 —— 无视冷却直接恢复
         strong = False
         if self._c("resume_question_trigger") and self._is_question(text):
             strong = True
@@ -328,26 +332,28 @@ class TopicGuard(Star):
             return True
         return False
 
-    # ---------------- 重复内容检测 ----------------
-    def _check_repeat(self, session, text):
-        if not self._c("repeat_enable"):
+    # ---------------- 双向循环检测（车轱辘话） ----------------
+    def _check_loop(self, session, text):
+        """新消息与循环窗口内 ≥loop_match_min 条消息相似（≥loop_similarity）即判定为循环"""
+        if not self._c("loop_enable"):
             return False
-        buf = session["repeat_buf"]
-        buf.append(text)
-        need = int(self._c("repeat_max"))
-        if len(buf) < max(need, 2):
+        t = text.strip()
+        if len(t) < 2:
             return False
-        items = list(buf)
-        sim = float(self._c("repeat_similarity"))
-        for i in range(len(items)):
-            for j in range(i + 1, len(items)):
-                try:
-                    r = difflib.SequenceMatcher(None, items[i], items[j]).ratio()
-                except Exception:
-                    continue
-                if r < sim:
-                    return False
-        return True
+        sim = float(self._c("loop_similarity"))
+        need = int(self._c("loop_match_min"))
+        matches = 0
+        for old in session["loop_buf"]:
+            try:
+                r = difflib.SequenceMatcher(None, t, old).ratio()
+            except Exception:
+                continue
+            if r >= sim:
+                matches += 1
+            if matches >= need:
+                break
+        session["loop_buf"].append(t)
+        return matches >= need
 
     # ---------------- LLM 判定 ----------------
     def _format_history(self, session, extra=None):
@@ -489,7 +495,7 @@ class TopicGuard(Star):
             session["judging"] = False
 
     # ---------------- 停止 / 恢复 / 发送 ----------------
-    async def _do_stop(self, session, reason, manual=False, force=False):
+    async def _do_stop(self, session, reason, manual=False, force=False, closing_text=None):
         if session["status"] == "stopped":
             return
         if not manual and not force:
@@ -508,7 +514,7 @@ class TopicGuard(Star):
         self._save_state()
         logger.info(f"[topic_guard] 会话 {session['cid']} 已停止: {reason}")
         if not manual:
-            await self._send_closing(session)
+            await self._send_closing(session, closing_text)
 
     async def _do_resume(self, session, reason):
         was_stopped = session["status"] == "stopped"
@@ -517,7 +523,7 @@ class TopicGuard(Star):
         session["consecutive_end"] = 0
         session["turns"] = 0
         session["judged_since"] = 0
-        session["repeat_buf"].clear()
+        session["loop_buf"].clear()
         session["history"].clear()
         session["stop_reason"] = ""
         session["resumed_at"] = time.time()
@@ -528,7 +534,7 @@ class TopicGuard(Star):
                 await self._safe_send(session, notice)
         self._save_state()
 
-    async def _send_closing(self, session):
+    async def _send_closing(self, session, text_override=None):
         mode = str(self._c("closing_mode"))
         if mode == "silent":
             return
@@ -539,8 +545,8 @@ class TopicGuard(Star):
         if now - session.get("closing_sent_at", 0) < float(self._c("closing_cooldown")):
             return
         session["closing_sent_at"] = now
-        text = str(self._c("closing_message"))
-        if mode == "summary":
+        text = text_override or str(self._c("closing_message"))
+        if mode == "summary" and not text_override:
             summary = await self._summarize(session)
             if summary:
                 text = f"{summary}\n\n{text}"
@@ -691,15 +697,19 @@ class TopicGuard(Star):
             self._record_peer_msg(session, event, text)
             self._maybe_decay(session, text)
 
+            # 1) 双向循环检测（车轱辘话）：优先于一切，直接打断
+            if self._check_loop(session, text):
+                await self._do_stop(session, "检测到重复循环（车轱辘话）", force=True,
+                                    closing_text=str(self._c("loop_stop_message")) or None)
+                return
+
+            # 2) 最大轮次保护
             max_turns = int(self._c("max_turns"))
             if max_turns > 0 and session["turns"] >= max_turns:
                 await self._do_stop(session, f"达到最大轮次({max_turns})", force=True)
                 return
 
-            if len(text) >= 2 and self._check_repeat(session, text):
-                await self._do_stop(session, "连续重复内容（疑似车轱辘话）", force=True)
-                return
-
+            # 3) LLM 判定触发
             if self._c("llm_judge_enable") and session["turns"] >= int(self._c("min_turns_before_stop")) and not session["judging"]:
                 kw_hit = self._hit_end_keywords(text)
                 short = len(text) <= int(self._c("judge_trigger_max_len"))
@@ -748,6 +758,13 @@ class TopicGuard(Star):
             session["last_bot_ts"] = time.time()
             session["last_bot_text"] = text
             self._mark_dirty()
+
+            # 机器人自己的回复也参与循环检测（重复回复同样打断）
+            if self._check_loop(session, text):
+                await self._do_stop(session, "检测到重复循环（机器人重复回复）", force=True,
+                                    closing_text=str(self._c("loop_stop_message")) or None)
+                return
+
             if not (self._c("judge_bot_reply") and self._c("llm_judge_enable")):
                 return
             if session["turns"] < int(self._c("min_turns_before_stop")):
